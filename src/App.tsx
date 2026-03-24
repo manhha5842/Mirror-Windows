@@ -32,6 +32,7 @@ export default function App() {
   const [selectedWindowIds, setSelectedWindowIds] = useState<string[]>([]);
   const [primaryWindowId, setPrimaryWindowId] = useState("");
   const [layoutMode, setLayoutMode] = useState<LayoutMode>("tile");
+  const [gameMode, setGameMode] = useState(false);
   const [selectedMonitorId, setSelectedMonitorId] = useState<string | null>(null);
   const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
   const [busyAction, setBusyAction] = useState<string | null>(null);
@@ -71,6 +72,17 @@ export default function App() {
     () => windows.find((window) => window.id === primaryWindowId) ?? null,
     [primaryWindowId, windows],
   );
+  const primaryMonitor = useMemo(
+    () => monitors.find((monitor) => monitor.is_primary) ?? null,
+    [monitors],
+  );
+  const activeLayoutMonitor = useMemo(() => {
+    if (selectedMonitorId) {
+      return monitorLookup.get(selectedMonitorId) ?? null;
+    }
+
+    return primaryMonitor;
+  }, [monitorLookup, primaryMonitor, selectedMonitorId]);
   const activeSession = useMemo(
     () => sessions.find((session) => session.id === currentSessionId) ?? null,
     [currentSessionId, sessions],
@@ -123,9 +135,11 @@ export default function App() {
       monitor_id: selectedMonitorId,
       layout_mode: layoutMode,
       coordinate_mode: "normalized_client",
-      sync_mouse_move: false,
-      sync_wheel: false,
+      dispatch_mode: gameMode ? "send_input" : "auto",
+      sync_mouse_move: true,
+      sync_wheel: true,
       sync_keyboard: false,
+      game_mode: gameMode,
     };
   }
 
@@ -423,6 +437,17 @@ export default function App() {
                   </option>
                 ))}
               </select>
+              <div className="value-box">
+                <div className="window-title-row">
+                  <strong>{primaryMonitor ? primaryMonitor.name : "Chua nhan dien duoc man hinh chinh"}</strong>
+                  {primaryMonitor ? <span className="primary-badge">Primary</span> : null}
+                </div>
+                <p className="field-hint">
+                  {activeLayoutMonitor
+                    ? `Dang sap xep tren: ${activeLayoutMonitor.name} (${activeLayoutMonitor.work_area.width}x${activeLayoutMonitor.work_area.height})`
+                    : "Chua co man hinh sap xep duoc chon."}
+                </p>
+              </div>
             </div>
 
             <div className="field">
@@ -441,6 +466,21 @@ export default function App() {
                   Chồng lớp
                 </button>
               </div>
+            </div>
+
+            <div className="field">
+              <label>Game Mode</label>
+              <label className="toggle">
+                <input
+                  type="checkbox"
+                  checked={gameMode}
+                  onChange={(event) => setGameMode(event.target.checked)}
+                />
+                <span>Game Mode</span>
+              </label>
+              <p className="field-hint">
+                Bat de uu tien SendInput va tang timing focus/click cho game.
+              </p>
             </div>
 
             <div className="action-row">
@@ -480,9 +520,7 @@ export default function App() {
                     onClick={() => setCurrentSessionId(session.id)}
                   >
                     <strong>{session.id}</strong>
-                    <span>
-                      {session.config.layout_mode === "tile" ? "Chia ô" : "Chồng lớp"} · {session.is_running ? "đang chạy" : "đang chờ"}
-                    </span>
+                    <span>{describeSession(session)}</span>
                   </button>
                 ))
               )}
@@ -543,6 +581,13 @@ function translateLogLevel(level: string) {
     default:
       return level.toUpperCase();
   }
+}
+
+function describeSession(session: SessionInfo) {
+  const layout = session.config.layout_mode === "tile" ? "Chia ô" : "Chồng lớp";
+  const profile = session.config.game_mode ? "game mode" : "chuẩn";
+  const state = session.is_running ? "đang chạy" : "đang chờ";
+  return `${layout} · ${profile} · ${state}`;
 }
 
 function formatTime(timestampMs: number) {

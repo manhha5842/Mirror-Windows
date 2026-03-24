@@ -33,8 +33,9 @@ use windows::Win32::UI::Shell::{SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_S
 use windows::Win32::UI::WindowsAndMessaging::{
   DestroyIcon, DrawIconEx, EnumWindows, GetWindowLongW, GetWindowRect, GetWindowTextLengthW,
   GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, IsZoomed,
-  SetWindowPos, ShowWindow, GWL_EXSTYLE, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, SWP_NOMOVE,
-  SWP_NOSIZE, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_SHOWWINDOW, SW_RESTORE, WS_EX_TOOLWINDOW,
+  SetWindowPos, ShowWindow, GWL_EXSTYLE, GWL_STYLE, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST,
+  SWP_NOMOVE, SWP_NOSIZE, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_SHOWWINDOW, SW_RESTORE,
+  WS_EX_TOOLWINDOW, WS_MAXIMIZEBOX, WS_THICKFRAME,
 };
 
 use crate::models::{Bounds, MonitorInfo, PermissionStatus, WindowInfo};
@@ -86,6 +87,13 @@ pub fn list_monitors() -> Result<Vec<MonitorInfo>> {
 
 pub fn move_resize_window(window_id: &str, bounds: &Bounds) -> Result<()> {
   let hwnd = parse_hwnd(window_id)?;
+  let can_resize = can_resize_window(hwnd);
+  let resize_flags = if can_resize {
+    windows::Win32::UI::WindowsAndMessaging::SET_WINDOW_POS_FLAGS(0)
+  } else {
+    SWP_NOSIZE
+  };
+  let target_bounds = clamp_window_bounds(hwnd, bounds, can_resize)?;
 
   if unsafe { IsIconic(hwnd).as_bool() || IsZoomed(hwnd).as_bool() } {
     unsafe {
@@ -97,31 +105,31 @@ pub fn move_resize_window(window_id: &str, bounds: &Bounds) -> Result<()> {
     SetWindowPos(
       hwnd,
       HWND_TOPMOST,
-      bounds.x,
-      bounds.y,
-      bounds.width.max(1),
-      bounds.height.max(1),
-      SWP_SHOWWINDOW | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+      target_bounds.x,
+      target_bounds.y,
+      target_bounds.width.max(1),
+      target_bounds.height.max(1),
+      SWP_SHOWWINDOW | SWP_NOACTIVATE | SWP_NOOWNERZORDER | resize_flags,
     )?;
 
     SetWindowPos(
       hwnd,
       HWND_NOTOPMOST,
-      bounds.x,
-      bounds.y,
-      bounds.width.max(1),
-      bounds.height.max(1),
-      SWP_SHOWWINDOW | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+      target_bounds.x,
+      target_bounds.y,
+      target_bounds.width.max(1),
+      target_bounds.height.max(1),
+      SWP_SHOWWINDOW | SWP_NOACTIVATE | SWP_NOOWNERZORDER | resize_flags,
     )?;
 
     SetWindowPos(
       hwnd,
       HWND_TOP,
-      bounds.x,
-      bounds.y,
-      bounds.width.max(1),
-      bounds.height.max(1),
-      SWP_SHOWWINDOW | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+      target_bounds.x,
+      target_bounds.y,
+      target_bounds.width.max(1),
+      target_bounds.height.max(1),
+      SWP_SHOWWINDOW | SWP_NOACTIVATE | SWP_NOOWNERZORDER | resize_flags,
     )?;
   }
 
@@ -298,6 +306,11 @@ fn is_candidate_window(hwnd: HWND) -> bool {
   !is_cloaked(hwnd)
 }
 
+fn can_resize_window(hwnd: HWND) -> bool {
+  let style = unsafe { GetWindowLongW(hwnd, GWL_STYLE) } as u32;
+  (style & WS_THICKFRAME.0 != 0) || (style & WS_MAXIMIZEBOX.0 != 0)
+}
+
 fn is_cloaked(hwnd: HWND) -> bool {
   let mut cloaked = 0u32;
   unsafe {
@@ -361,6 +374,57 @@ fn read_window_rect(hwnd: HWND) -> Result<Bounds> {
     GetWindowRect(hwnd, &mut rect)?;
   }
   Ok(bounds_from_rect(&rect))
+}
+
+fn clamp_window_bounds(hwnd: HWND, requested: &Bounds, can_resize: bool) -> Result<Bounds> {
+  const OUTER_MARGIN: i32 = 12;
+
+  let monitors = list_monitors()?;
+  let target_center_x = requested.x + requested.width / 2;
+  let target_center_y = requested.y + requested.height / 2;
+
+  let monitor_area = monitors
+    .iter()
+    .find(|monitor| {
+      let area = &monitor.work_area;
+      target_center_x >= area.x
+        && target_center_x < area.x + area.width
+        && target_center_y >= area.y
+        && target_center_y < area.y + area.height
+    })
+    .map(|monitor| monitor.work_area.clone())
+    .or_else(|| monitors.iter().find(|monitor| monitor.is_primary).map(|monitor| monitor.work_area.clone()))
+    .or_else(|| monitors.first().map(|monitor| monitor.work_area.clone()))
+    .ok_or_else(|| anyhow!("No monitor work area available for window placement."))?;
+
+  let safe_area = Bounds {
+    x: monitor_area.x + OUTER_MARGIN,
+    y: monitor_area.y + OUTER_MARGIN,
+    width: (monitor_area.width - OUTER_MARGIN * 2).max(1),
+    height: (monitor_area.height - OUTER_MARGIN * 2).max(1),
+  };
+
+  let current_rect = read_window_rect(hwnd)?;
+  let width = if can_resize {
+    requested.width.min(safe_area.width).max(1)
+  } else {
+    current_rect.width.min(safe_area.width).max(1)
+  };
+  let height = if can_resize {
+    requested.height.min(safe_area.height).max(1)
+  } else {
+    current_rect.height.min(safe_area.height).max(1)
+  };
+
+  let max_x = safe_area.x + safe_area.width - width;
+  let max_y = safe_area.y + safe_area.height - height;
+
+  Ok(Bounds {
+    x: requested.x.clamp(safe_area.x, max_x),
+    y: requested.y.clamp(safe_area.y, max_y),
+    width,
+    height,
+  })
 }
 
 fn read_process_path(pid: u32) -> Result<String> {

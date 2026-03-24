@@ -29,6 +29,7 @@ export type MonitorInfo = {
 
 export type LayoutMode = "tile" | "stack";
 export type CoordinateMode = "normalized_client";
+export type DispatchMode = "window_message" | "send_input" | "auto";
 
 export type SessionConfig = {
   primary_window_id: string;
@@ -36,9 +37,11 @@ export type SessionConfig = {
   monitor_id: string | null;
   layout_mode: LayoutMode;
   coordinate_mode: CoordinateMode;
+  dispatch_mode: DispatchMode;
   sync_mouse_move: boolean;
   sync_wheel: boolean;
   sync_keyboard: boolean;
+  game_mode: boolean;
 };
 
 export type SessionInfo = {

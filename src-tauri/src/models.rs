@@ -45,6 +45,17 @@ pub enum CoordinateMode {
   NormalizedClient,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DispatchMode {
+  /// Sử dụng PostMessage/SendMessage (tốt cho browser, ứng dụng thông thường)
+  WindowMessage,
+  /// Sử dụng SendInput API (tốt cho game, DirectX/OpenGL apps)
+  SendInput,
+  /// Tự động phát hiện và chọn mode phù hợp
+  Auto,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionConfig {
   pub primary_window_id: String,
@@ -53,12 +64,16 @@ pub struct SessionConfig {
   pub layout_mode: LayoutMode,
   #[serde(default = "default_coordinate_mode")]
   pub coordinate_mode: CoordinateMode,
+  #[serde(default = "default_dispatch_mode")]
+  pub dispatch_mode: DispatchMode,
   #[serde(default = "default_true")]
   pub sync_mouse_move: bool,
   #[serde(default = "default_true")]
   pub sync_wheel: bool,
   #[serde(default = "default_true")]
   pub sync_keyboard: bool,
+  #[serde(default)]
+  pub game_mode: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -125,4 +140,8 @@ fn default_true() -> bool {
 
 fn default_coordinate_mode() -> CoordinateMode {
   CoordinateMode::NormalizedClient
+}
+
+fn default_dispatch_mode() -> DispatchMode {
+  DispatchMode::Auto
 }

@@ -1,5 +1,6 @@
 mod commands;
 mod coordinate_mapper;
+mod game_input_dispatcher;
 mod input_capture;
 mod input_dispatcher;
 mod layout_engine;

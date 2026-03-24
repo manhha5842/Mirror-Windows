@@ -98,28 +98,41 @@ fn tile_slots(area: &Bounds, count: usize) -> Vec<Bounds> {
     return Vec::new();
   }
 
-  let cols = (f64::sqrt(count as f64).ceil() as usize).max(1);
-  let rows = ((count + cols - 1) / cols).max(1);
+  let outer_padding = area.width.min(area.height).clamp(12, 28);
+  let gap = (outer_padding / 2).max(8);
+  let safe_area = inset_bounds(area, outer_padding);
+  let (cols, rows) = best_tile_grid(&safe_area, count);
   let mut slots = Vec::with_capacity(count);
 
   for index in 0..count {
     let row = index / cols;
     let col = index % cols;
 
-    let x = area.x + ((col as i32 * area.width) / cols as i32);
-    let next_x = area.x + (((col + 1) as i32 * area.width) / cols as i32);
-    let y = area.y + ((row as i32 * area.height) / rows as i32);
-    let next_y = area.y + (((row + 1) as i32 * area.height) / rows as i32);
+    let x = safe_area.x + ((col as i32 * safe_area.width) / cols as i32);
+    let next_x = safe_area.x + (((col + 1) as i32 * safe_area.width) / cols as i32);
+    let y = safe_area.y + ((row as i32 * safe_area.height) / rows as i32);
+    let next_y = safe_area.y + (((row + 1) as i32 * safe_area.height) / rows as i32);
+
+    let is_last_col = col + 1 == cols;
+    let is_last_row = row + 1 == rows;
+
+    let left_gap = if col == 0 { 0 } else { gap / 2 };
+    let right_gap = if is_last_col { 0 } else { (gap + 1) / 2 };
+    let top_gap = if row == 0 { 0 } else { gap / 2 };
+    let bottom_gap = if is_last_row { 0 } else { (gap + 1) / 2 };
 
     slots.push(Bounds {
-      x,
-      y,
-      width: (next_x - x).max(1),
-      height: (next_y - y).max(1),
+      x: x + left_gap,
+      y: y + top_gap,
+      width: (next_x - x - left_gap - right_gap).max(160),
+      height: (next_y - y - top_gap - bottom_gap).max(120),
     });
   }
 
   slots
+    .into_iter()
+    .map(|slot| clamp_bounds_to_area(slot, &safe_area))
+    .collect()
 }
 
 fn stack_slots(area: &Bounds, count: usize) -> Vec<Bounds> {
@@ -159,4 +172,51 @@ fn stack_slots(area: &Bounds, count: usize) -> Vec<Bounds> {
       height: height.min(area.height).max(1),
     })
     .collect()
+}
+
+fn best_tile_grid(area: &Bounds, count: usize) -> (usize, usize) {
+  let target_ratio = area.width as f64 / area.height.max(1) as f64;
+  let mut best = (count, 1);
+  let mut best_score = f64::INFINITY;
+
+  for cols in 1..=count {
+    let rows = count.div_ceil(cols);
+    let cell_width = area.width as f64 / cols as f64;
+    let cell_height = area.height as f64 / rows as f64;
+    let cell_ratio = cell_width / cell_height.max(1.0);
+    let empty_cells = cols * rows - count;
+    let score =
+      (cell_ratio - target_ratio).abs() + (empty_cells as f64 * 0.35) + ((rows as i32 - cols as i32).abs() as f64 * 0.08);
+
+    if score < best_score {
+      best = (cols, rows);
+      best_score = score;
+    }
+  }
+
+  best
+}
+
+fn inset_bounds(area: &Bounds, padding: i32) -> Bounds {
+  let double_padding = padding.saturating_mul(2);
+  Bounds {
+    x: area.x + padding,
+    y: area.y + padding,
+    width: (area.width - double_padding).max(1),
+    height: (area.height - double_padding).max(1),
+  }
+}
+
+fn clamp_bounds_to_area(bounds: Bounds, area: &Bounds) -> Bounds {
+  let width = bounds.width.min(area.width).max(1);
+  let height = bounds.height.min(area.height).max(1);
+  let max_x = area.x + area.width - width;
+  let max_y = area.y + area.height - height;
+
+  Bounds {
+    x: bounds.x.clamp(area.x, max_x),
+    y: bounds.y.clamp(area.y, max_y),
+    width,
+    height,
+  }
 }

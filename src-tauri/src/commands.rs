@@ -4,7 +4,7 @@ use crate::models::{
   LogEntry, MonitorInfo, PermissionStatus, ProfileDraft, ProfileRecord, SessionConfig, SessionInfo,
   WindowInfo,
 };
-use crate::state::{push_log, AppState};
+use crate::state::{list_all_logs, push_log, AppState};
 use crate::{permissions, profile_store, sync_session, window_registry};
 
 type CommandResult<T> = Result<T, String>;
@@ -98,5 +98,5 @@ pub fn load_profiles(app: AppHandle) -> CommandResult<Vec<ProfileRecord>> {
 
 #[tauri::command]
 pub fn get_logs(state: State<'_, AppState>) -> Vec<LogEntry> {
-  state.list_logs()
+  list_all_logs(&state)
 }
