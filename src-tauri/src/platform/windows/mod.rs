@@ -547,7 +547,18 @@ fn icon_to_data_url(icon: windows::Win32::UI::WindowsAndMessaging::HICON) -> Opt
   };
 
   let mut bits = null_mut();
-  let dib = unsafe { CreateDIBSection(screen_dc, &bmi, DIB_RGB_COLORS, &mut bits, None, 0) }.ok()?;
+  let dib = match unsafe { CreateDIBSection(screen_dc, &bmi, DIB_RGB_COLORS, &mut bits, None, 0) } {
+    Ok(bitmap) => bitmap,
+    Err(_) => {
+      unsafe {
+        let _ = DeleteDC(memory_dc);
+        let _ = windows::Win32::Graphics::Gdi::ReleaseDC(HWND(null_mut()), screen_dc);
+        let _ = DeleteObject(icon_info.hbmColor);
+        let _ = DeleteObject(icon_info.hbmMask);
+      }
+      return None;
+    }
+  };
   let old_bitmap = unsafe { SelectObject(memory_dc, HGDIOBJ(dib.0)) };
   let draw_result = unsafe { DrawIconEx(memory_dc, 0, 0, icon, width, height, 0, None, windows::Win32::UI::WindowsAndMessaging::DI_NORMAL) };
 
@@ -563,14 +574,37 @@ fn icon_to_data_url(icon: windows::Win32::UI::WindowsAndMessaging::HICON) -> Opt
     }
 
     let mut png_bytes = Vec::new();
-    let mut encoder = Encoder::new(&mut png_bytes, width as u32, height as u32);
-    encoder.set_color(ColorType::Rgba);
-    encoder.set_depth(BitDepth::Eight);
     {
-      let mut writer = encoder.write_header().ok()?;
-      writer.write_image_data(&rgba).ok()?;
+      let mut encoder = Encoder::new(&mut png_bytes, width as u32, height as u32);
+      encoder.set_color(ColorType::Rgba);
+      encoder.set_depth(BitDepth::Eight);
+      let mut writer = match encoder.write_header() {
+        Ok(writer) => writer,
+        Err(_) => {
+          unsafe {
+            let _ = SelectObject(memory_dc, old_bitmap);
+            let _ = DeleteObject(dib);
+            let _ = DeleteDC(memory_dc);
+            let _ = windows::Win32::Graphics::Gdi::ReleaseDC(HWND(null_mut()), screen_dc);
+            let _ = DeleteObject(icon_info.hbmColor);
+            let _ = DeleteObject(icon_info.hbmMask);
+          }
+          return None;
+        }
+      };
+      if writer.write_image_data(&rgba).is_err() {
+        unsafe {
+          let _ = SelectObject(memory_dc, old_bitmap);
+          let _ = DeleteObject(dib);
+          let _ = DeleteDC(memory_dc);
+          let _ = windows::Win32::Graphics::Gdi::ReleaseDC(HWND(null_mut()), screen_dc);
+          let _ = DeleteObject(icon_info.hbmColor);
+          let _ = DeleteObject(icon_info.hbmMask);
+        }
+        return None;
+      }
     }
-    Some(format!("data:image/png;base64,{}", BASE64_STANDARD.encode(png_bytes)))
+    Some(format!("data:image/png;base64,{}", BASE64_STANDARD.encode(&png_bytes)))
   } else {
     None
   };

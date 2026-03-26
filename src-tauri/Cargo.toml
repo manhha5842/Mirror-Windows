@@ -1,8 +1,8 @@
 [package]
 name = "mirror-windows"
-version = "0.1.1"
+version = "0.2.0"
 description = "Windows-first Tauri control panel for synchronizing external desktop windows"
-authors = ["Codex"]
+authors = ["Haha Studio"]
 license = "MIT"
 repository = ""
 edition = "2021"

@@ -479,7 +479,7 @@ export default function App() {
                 <span>Game Mode</span>
               </label>
               <p className="field-hint">
-                Bat de uu tien SendInput va tang timing focus/click cho game.
+                Bat de uu tien SendInput. De giam lag va treo may, game mode khong mirror hover mouse move, nen drag se duoc giam mat do va chi ho tro toi da 4 cua so dich. Neu co dau hieu do, bam Ctrl+Shift+F12 de cat mirror khan cap.
               </p>
             </div>
 

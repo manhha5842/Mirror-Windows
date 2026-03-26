@@ -1,10 +1,11 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
@@ -13,23 +14,24 @@ use windows::Win32::System::SystemServices::{
   MK_CONTROL, MK_LBUTTON, MK_MBUTTON, MK_RBUTTON, MK_SHIFT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::GetCurrentThreadId;
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_CONTROL, VK_SHIFT};
+use windows::Win32::System::Threading::{GetCurrentThreadId, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION};
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_CONTROL, VK_F12, VK_SHIFT};
 use windows::Win32::UI::WindowsAndMessaging::{
   CallNextHookEx, ChildWindowFromPointEx, DispatchMessageW, GetAncestor, GetClientRect,
-  GetCursorPos, GetMessageW, HHOOK, IsWindow, LLMHF_INJECTED, MSLLHOOKSTRUCT, MSG, PostMessageW,
+  GetCursorPos, GetMessageW, HHOOK, IsWindow, KBDLLHOOKSTRUCT, LLKHF_INJECTED, LLMHF_INJECTED,
+  MSLLHOOKSTRUCT, MSG, PostMessageW,
   PostThreadMessageW, SendMessageTimeoutW, SetCursorPos, SetForegroundWindow,
   SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WindowFromPoint,
   CWP_SKIPDISABLED, CWP_SKIPINVISIBLE, CWP_SKIPTRANSPARENT, GA_ROOT, HC_ACTION,
-  SMTO_ABORTIFHUNG, SMTO_BLOCK, WH_MOUSE_LL, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
-  WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN,
-  WM_RBUTTONUP,
+  SMTO_ABORTIFHUNG, SMTO_BLOCK, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_LBUTTONDOWN,
+  WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+  WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN,
 };
 
 use crate::coordinate_mapper::{normalize_client_point, project_to_client, NormalizedPoint};
 use crate::game_input_dispatcher::GameInputDispatcher;
 use crate::models::{Bounds, DispatchMode, LayoutMode, LogLevel, SessionConfig};
-use crate::state::push_runtime_log;
+use crate::state::{push_runtime_log, unix_time_ms};
 
 use super::{bring_window_to_front, ensure_bool, parse_hwnd};
 
@@ -39,6 +41,16 @@ const CLICK_SLOP_PX: i32 = 6;
 const FOREGROUND_TARGET_SETTLE_MS: u64 = 70;
 const GAME_MODE_FOREGROUND_TARGET_SETTLE_MS: u64 = 130;
 const PRIMARY_CLICK_SETTLE_MS: u64 = 45;
+const SUMMARY_LOG_COOLDOWN_MS: u128 = 3_000;
+const ISSUE_LOG_COOLDOWN_MS: u128 = 5_000;
+const TARGET_REMOVAL_LOG_COOLDOWN_MS: u128 = 15_000;
+const CLICK_TRACE_LOG_COOLDOWN_MS: u128 = 10_000;
+const PRIMARY_INVALID_LOG_COOLDOWN_MS: u128 = 10_000;
+const DEFAULT_GESTURE_POINT_DELTA: f64 = 0.001;
+const GAME_MODE_GESTURE_POINT_DELTA: f64 = 0.01;
+const MAX_GAME_MODE_GESTURE_POINTS: usize = 48;
+const EMERGENCY_STOP_KEY: u32 = VK_F12.0 as u32;
+const GAME_MODE_REPLAY_WATCHDOG_MS: u128 = 1_500;
 
 static RUNTIME_HANDLE: OnceLock<Mutex<Option<SyncRuntimeHandle>>> = OnceLock::new();
 static HOOK_CONTEXT: OnceLock<Mutex<Option<Arc<SyncRuntimeContext>>>> = OnceLock::new();
@@ -134,9 +146,11 @@ struct SyncRuntimeContext {
   session_id: String,
   config: SessionConfig,
   primary_root: usize,
-  target_roots: Vec<usize>,
+  target_roots: Mutex<Vec<usize>>,
   pointer_state: Mutex<PointerState>,
   logged_dispatch_targets: Mutex<HashSet<usize>>,
+  throttled_logs: Mutex<HashMap<String, u128>>,
+  circuit_breaker_open: AtomicBool,
   replay_in_progress: AtomicBool,
 }
 
@@ -194,19 +208,28 @@ impl SyncRuntimeContext {
       .filter(|window_id| parse_hwnd(window_id).map(|hwnd| unsafe { IsWindow(hwnd).as_bool() }).unwrap_or(false))
       .collect();
 
+    if target_roots.is_empty() {
+      return Err(anyhow!(
+        "No live target windows were available when starting sync."
+      ));
+    }
+
     Ok(Self {
       session_id: session_id.to_string(),
       config,
       primary_root: hwnd_to_handle(primary_root),
-      target_roots,
+      target_roots: Mutex::new(target_roots),
       pointer_state: Mutex::new(PointerState::default()),
       logged_dispatch_targets: Mutex::new(HashSet::new()),
+      throttled_logs: Mutex::new(HashMap::new()),
+      circuit_breaker_open: AtomicBool::new(false),
       replay_in_progress: AtomicBool::new(false),
     })
   }
 
   fn handle_mouse(&self, message: u32, hook: &MSLLHOOKSTRUCT) -> bool {
-    if (hook.flags & LLMHF_INJECTED) != 0 || self.target_roots.is_empty() {
+    let target_roots = self.target_roots_snapshot();
+    if (hook.flags & LLMHF_INJECTED) != 0 || target_roots.is_empty() {
       return false;
     }
 
@@ -214,8 +237,25 @@ impl SyncRuntimeContext {
       return is_physical_mouse_message(message);
     }
 
+    if self.circuit_breaker_open.load(Ordering::Acquire) {
+      return false;
+    }
+
+    if unsafe { !IsWindow(handle_to_hwnd(self.primary_root)).as_bool() } {
+      self.log_throttled(
+        LogLevel::Warn,
+        "primary_window_invalid",
+        format!(
+          "Session {} paused mirroring because the primary window is no longer valid.",
+          self.session_id
+        ),
+        PRIMARY_INVALID_LOG_COOLDOWN_MS,
+      );
+      return false;
+    }
+
     if message == WM_MOUSEWHEEL || message == WM_MOUSEHWHEEL {
-      self.handle_wheel(message, hook);
+      self.handle_wheel(message, hook, &target_roots);
       return false;
     }
 
@@ -229,7 +269,13 @@ impl SyncRuntimeContext {
     let inside_primary = source_root == self.primary_root;
     let started_drag = pointer_state.drag_from_primary;
 
-    if !should_process_mouse_message(message, inside_primary, started_drag, self.config.sync_mouse_move) {
+    if !should_process_mouse_message(
+      message,
+      inside_primary,
+      started_drag,
+      self.config.sync_mouse_move,
+      self.config.game_mode,
+    ) {
       return false;
     }
 
@@ -271,7 +317,7 @@ impl SyncRuntimeContext {
       Some(_) if message == WM_MOUSEMOVE && pointer_state.buttons_down != 0 => {
         if !should_treat_as_click_hold(&pointer_state, primary_client_point) {
           if let Some(gesture) = pointer_state.buffered_gesture.as_mut() {
-            if should_append_buffered_point(gesture, normalized_point) {
+            if should_append_buffered_point(gesture, normalized_point, self.config.game_mode) {
               gesture.points.push(normalized_point);
             }
           }
@@ -280,7 +326,9 @@ impl SyncRuntimeContext {
       }
       Some(button) if is_button_up_message(message) => {
         if let Some(gesture) = pointer_state.buffered_gesture.as_mut() {
-          if gesture.button_mask == button && should_append_buffered_point(gesture, normalized_point) {
+          if gesture.button_mask == button
+            && should_append_buffered_point(gesture, normalized_point, self.config.game_mode)
+          {
             gesture.points.push(normalized_point);
           }
         }
@@ -333,13 +381,13 @@ impl SyncRuntimeContext {
   }
 
   fn log_session_targets(&self) {
-    let targets = if self.target_roots.is_empty() {
+    let target_roots = self.target_roots_snapshot();
+    let targets = if target_roots.is_empty() {
       "[]".to_string()
     } else {
       format!(
         "[{}]",
-        self
-          .target_roots
+        target_roots
           .iter()
           .map(|target| format_handle_handle(*target))
           .collect::<Vec<_>>()
@@ -354,12 +402,16 @@ impl SyncRuntimeContext {
         self.session_id,
         format_handle_handle(self.primary_root),
         targets,
-        self.target_roots.len()
+        target_roots.len()
       ),
     );
   }
 
-  fn handle_wheel(&self, message: u32, hook: &MSLLHOOKSTRUCT) {
+  fn handle_wheel(&self, message: u32, hook: &MSLLHOOKSTRUCT, target_roots: &[usize]) {
+    if self.circuit_breaker_open.load(Ordering::Acquire) {
+      return;
+    }
+
     let primary_screen_point = hook.pt;
     let source_root = root_window_from_point(primary_screen_point);
     if source_root != self.primary_root {
@@ -386,7 +438,7 @@ impl SyncRuntimeContext {
 
     let mut dummy_pointer_state = PointerState::default();
     let mut summary = DispatchSummary::default();
-    for &target_root in &self.target_roots {
+    for &target_root in target_roots {
       summary.attempted += 1;
       let outcome = self.dispatch_mouse_to_target(
         target_root,
@@ -416,20 +468,35 @@ impl SyncRuntimeContext {
     let _replay_guard = ReplayGuard {
       flag: &self.replay_in_progress,
     };
+    let target_roots = self.target_roots_snapshot();
+    if target_roots.is_empty() {
+      return;
+    }
+    let replay_started_at = Instant::now();
     let mut summary = DispatchSummary::default();
     let cursor_before = current_cursor_pos();
-    push_runtime_log(
+    self.log_throttled(
       LogLevel::Info,
+      format!(
+        "replay:{}:{}:{}",
+        self.session_id,
+        gesture.down_message,
+        gesture.points.len()
+      ),
       format!(
         "Session {} replaying buffered {} gesture with {} points to {} targets.",
         self.session_id,
         mouse_message_name(gesture.down_message),
         gesture.points.len(),
-        self.target_roots.len()
+        target_roots.len()
       ),
+      SUMMARY_LOG_COOLDOWN_MS,
     );
 
-    for &target_root in &self.target_roots {
+    for &target_root in &target_roots {
+      if self.circuit_breaker_open.load(Ordering::Acquire) {
+        break;
+      }
       summary.attempted += 1;
       let outcome = self.replay_gesture_to_target(target_root, &gesture, mouse_data);
       self.apply_dispatch_outcome(&mut summary, target_root, gesture.up_message, outcome);
@@ -437,6 +504,13 @@ impl SyncRuntimeContext {
 
     self.focus_window(handle_to_hwnd(self.primary_root));
     restore_cursor_pos(cursor_before);
+
+    if self.config.game_mode && replay_started_at.elapsed().as_millis() > GAME_MODE_REPLAY_WATCHDOG_MS {
+      self.trip_circuit_breaker(format!(
+        "Game mode watchdog stopped mirroring because one replay took more than {} ms.",
+        GAME_MODE_REPLAY_WATCHDOG_MS
+      ));
+    }
 
     self.log_summary_if_needed(gesture.up_message, summary);
   }
@@ -447,23 +521,31 @@ impl SyncRuntimeContext {
     gesture: &BufferedPointerGesture,
     mouse_data: u32,
   ) -> DispatchOutcome {
-    let Some(first_point) = gesture.points.first().copied() else {
+    let replay_points = if self.config.game_mode {
+      downsample_gesture_points(&gesture.points, MAX_GAME_MODE_GESTURE_POINTS)
+    } else {
+      gesture.points.clone()
+    };
+
+    let Some(first_point) = replay_points.first().copied() else {
       return DispatchOutcome::Skipped("buffered gesture had no points".to_string());
     };
 
     let target_hwnd = handle_to_hwnd(target_root);
     if unsafe { !IsWindow(target_hwnd).as_bool() } {
+      self.mark_target_unavailable(target_root, "target window is no longer valid");
       return DispatchOutcome::Skipped("target window is no longer valid".to_string());
     }
 
     if self.config.game_mode {
       let Ok(target_client_rect) = get_client_rect(target_hwnd) else {
+        self.mark_target_unavailable(target_root, "failed to read target client rect");
         return DispatchOutcome::Skipped("failed to read target client rect".to_string());
       };
       let target_bounds = bounds_from_client_rect(target_client_rect);
       return match GameInputDispatcher::dispatch_gesture(
         target_hwnd,
-        &gesture.points,
+        &replay_points,
         &target_bounds,
         gesture.down_message,
         gesture.up_message,
@@ -482,12 +564,11 @@ impl SyncRuntimeContext {
       return down_outcome;
     }
 
-    for point in gesture
-      .points
+    for point in replay_points
       .iter()
       .copied()
       .skip(1)
-      .take(gesture.points.len().saturating_sub(2))
+      .take(replay_points.len().saturating_sub(2))
     {
       let move_outcome =
         self.dispatch_send_input_to_target(target_root, WM_MOUSEMOVE, point, mouse_data);
@@ -496,7 +577,7 @@ impl SyncRuntimeContext {
       }
     }
 
-    let last_point = gesture.points.last().copied().unwrap_or(first_point);
+    let last_point = replay_points.last().copied().unwrap_or(first_point);
     self.dispatch_send_input_to_target(target_root, gesture.up_message, last_point, mouse_data)
   }
 
@@ -537,8 +618,9 @@ impl SyncRuntimeContext {
       return;
     }
 
-    push_runtime_log(
+    self.log_throttled(
       LogLevel::Warn,
+      format!("summary:{}:{}", self.session_id, message),
       format!(
         "Session {} mirrored {} to {}/{} targets. window_message={}, send_input={}, failed={}.",
         self.session_id,
@@ -549,6 +631,7 @@ impl SyncRuntimeContext {
         summary.send_input,
         summary.failed
       ),
+      SUMMARY_LOG_COOLDOWN_MS,
     );
   }
 
@@ -563,10 +646,12 @@ impl SyncRuntimeContext {
   ) -> DispatchOutcome {
     let target_root = handle_to_hwnd(target_root_handle);
     if unsafe { !IsWindow(target_root).as_bool() } {
+      self.mark_target_unavailable(target_root_handle, "target window is no longer valid");
       return DispatchOutcome::Skipped("target window is no longer valid".to_string());
     }
 
     let Ok(target_client_rect) = get_client_rect(target_root) else {
+      self.mark_target_unavailable(target_root_handle, "failed to read target client rect");
       return DispatchOutcome::Skipped("failed to read target client rect".to_string());
     };
     let target_bounds = bounds_from_client_rect(target_client_rect);
@@ -708,8 +793,15 @@ impl SyncRuntimeContext {
     } else {
       LogLevel::Info
     };
-    push_runtime_log(
+    self.log_throttled(
       level,
+      format!(
+        "dispatch_issue:{}:{}:{}:{}",
+        self.session_id,
+        target_root_handle,
+        message,
+        error
+      ),
       format!(
         "Session {} failed to mirror {} to target {} via {}: {}.",
         self.session_id,
@@ -718,6 +810,7 @@ impl SyncRuntimeContext {
         dispatch_mode_name(dispatch_mode),
         error
       ),
+      ISSUE_LOG_COOLDOWN_MS,
     );
   }
 
@@ -727,8 +820,15 @@ impl SyncRuntimeContext {
     } else {
       LogLevel::Info
     };
-    push_runtime_log(
+    self.log_throttled(
       level,
+      format!(
+        "dispatch_skip:{}:{}:{}:{}",
+        self.session_id,
+        target_root_handle,
+        message,
+        reason
+      ),
       format!(
         "Session {} skipped {} for target {}: {}.",
         self.session_id,
@@ -736,6 +836,7 @@ impl SyncRuntimeContext {
         format_handle_handle(target_root_handle),
         reason
       ),
+      ISSUE_LOG_COOLDOWN_MS,
     );
   }
 
@@ -744,8 +845,15 @@ impl SyncRuntimeContext {
       return;
     }
 
-    push_runtime_log(
+    self.log_throttled(
       LogLevel::Info,
+      format!(
+        "click_trace:{}:{}:{}:{}",
+        self.session_id,
+        target_root_handle,
+        stage,
+        dispatch_mode_name(dispatch_mode)
+      ),
       format!(
         "Session {} target {} {} via {}.",
         self.session_id,
@@ -753,6 +861,7 @@ impl SyncRuntimeContext {
         stage,
         dispatch_mode_name(dispatch_mode)
       ),
+      CLICK_TRACE_LOG_COOLDOWN_MS,
     );
   }
 
@@ -777,10 +886,12 @@ impl SyncRuntimeContext {
   ) -> DispatchOutcome {
     let target_root = handle_to_hwnd(target_root_handle);
     if unsafe { !IsWindow(target_root).as_bool() } {
+      self.mark_target_unavailable(target_root_handle, "target window is no longer valid");
       return DispatchOutcome::Skipped("target window is no longer valid".to_string());
     }
 
     let Ok(target_client_rect) = get_client_rect(target_root) else {
+      self.mark_target_unavailable(target_root_handle, "failed to read target client rect");
       return DispatchOutcome::Skipped("failed to read target client rect".to_string());
     };
     let target_bounds = bounds_from_client_rect(target_client_rect);
@@ -804,6 +915,117 @@ impl SyncRuntimeContext {
     }
   }
 
+  fn target_roots_snapshot(&self) -> Vec<usize> {
+    self
+      .target_roots
+      .lock()
+      .unwrap_or_else(|poisoned| poisoned.into_inner())
+      .clone()
+  }
+
+  fn mark_target_unavailable(&self, target_root_handle: usize, reason: &str) {
+    let removed = {
+      let mut targets = self
+        .target_roots
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+      let original_len = targets.len();
+      targets.retain(|handle| *handle != target_root_handle);
+      targets.len() != original_len
+    };
+
+    if removed {
+      self
+        .logged_dispatch_targets
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&target_root_handle);
+    }
+
+    self.log_throttled(
+      LogLevel::Warn,
+      format!(
+        "target_removed:{}:{}:{}",
+        self.session_id,
+        target_root_handle,
+        reason
+      ),
+      format!(
+        "Session {} removed target {} from live mirroring: {}.",
+        self.session_id,
+        format_handle_handle(target_root_handle),
+        reason
+      ),
+      TARGET_REMOVAL_LOG_COOLDOWN_MS,
+    );
+  }
+
+  fn log_throttled(
+    &self,
+    level: LogLevel,
+    key: impl Into<String>,
+    message: impl Into<String>,
+    cooldown_ms: u128,
+  ) {
+    let key = key.into();
+    let now = unix_time_ms();
+    let should_log = {
+      let mut throttled_logs = self
+        .throttled_logs
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+      match throttled_logs.get(&key).copied() {
+        Some(last_logged_at) if now.saturating_sub(last_logged_at) < cooldown_ms => false,
+        _ => {
+          throttled_logs.insert(key, now);
+          true
+        }
+      }
+    };
+
+    if should_log {
+      push_runtime_log(level, message);
+    }
+  }
+
+  fn handle_emergency_stop_hotkey(&self, message: u32, keyboard: &KBDLLHOOKSTRUCT) -> bool {
+    if (keyboard.flags & LLKHF_INJECTED).0 != 0 {
+      return false;
+    }
+
+    if !matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN) {
+      return false;
+    }
+
+    if keyboard.vkCode != EMERGENCY_STOP_KEY {
+      return false;
+    }
+
+    let ctrl_down = (unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) } as u16 & 0x8000) != 0;
+    let shift_down = (unsafe { GetAsyncKeyState(VK_SHIFT.0 as i32) } as u16 & 0x8000) != 0;
+    if !(ctrl_down && shift_down) {
+      return false;
+    }
+
+    self.trip_circuit_breaker(
+      "Emergency stop activated by Ctrl+Shift+F12. Mirroring has been cut off immediately."
+        .to_string(),
+    );
+    true
+  }
+
+  fn trip_circuit_breaker(&self, reason: String) {
+    let was_open = self.circuit_breaker_open.swap(true, Ordering::AcqRel);
+    if !was_open {
+      self.log_throttled(
+        LogLevel::Error,
+        format!("circuit_breaker:{}", self.session_id),
+        reason,
+        1_000,
+      );
+    }
+  }
+
 }
 
 fn run_message_loop(
@@ -820,6 +1042,17 @@ fn run_message_loop(
       return;
     }
   };
+  let keyboard_hook = match install_keyboard_hook(Arc::clone(&context)) {
+    Ok(hook) => hook,
+    Err(error) => {
+      unsafe {
+        let _ = UnhookWindowsHookEx(mouse_hook);
+      }
+      let _ = started_tx.send(Err(error.to_string()));
+      clear_hook_context();
+      return;
+    }
+  };
 
   let _ = started_tx.send(Ok(thread_id));
 
@@ -830,7 +1063,17 @@ fn run_message_loop(
     }
 
     let status = unsafe { GetMessageW(&mut message, HWND(null_mut()), 0, 0) };
-    if status.0 == -1 || status.0 == 0 || message.message == WM_QUIT {
+    if status.0 == -1 {
+      push_runtime_log(
+        LogLevel::Error,
+        format!(
+          "Session {} sync loop stopped because GetMessageW returned an error.",
+          context.session_id
+        ),
+      );
+      break;
+    }
+    if status.0 == 0 || message.message == WM_QUIT {
       break;
     }
 
@@ -841,6 +1084,7 @@ fn run_message_loop(
   }
 
   unsafe {
+    let _ = UnhookWindowsHookEx(keyboard_hook);
     let _ = UnhookWindowsHookEx(mouse_hook);
   }
 
@@ -860,12 +1104,57 @@ fn install_mouse_hook(context: Arc<SyncRuntimeContext>) -> Result<HHOOK> {
   })
 }
 
+fn install_keyboard_hook(context: Arc<SyncRuntimeContext>) -> Result<HHOOK> {
+  set_hook_context(Some(context));
+
+  let module = unsafe { GetModuleHandleW(None) }
+    .map_err(|error| anyhow!("Failed to resolve current module for keyboard hooks: {error}"))?;
+  let hook_instance = HINSTANCE(module.0);
+  let keyboard_hook =
+    unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook_proc), hook_instance, 0) };
+  keyboard_hook.map_err(|error| {
+    clear_hook_context();
+    anyhow!("Failed to install keyboard hook: {error}")
+  })
+}
+
 unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
   if code == HC_ACTION as i32 {
     if let Some(context) = current_hook_context() {
       let hook = &*(lparam.0 as *const MSLLHOOKSTRUCT);
-      if context.handle_mouse(wparam.0 as u32, hook) {
-        return LRESULT(1);
+      let hook_result = catch_unwind(AssertUnwindSafe(|| context.handle_mouse(wparam.0 as u32, hook)));
+      match hook_result {
+        Ok(true) => return LRESULT(1),
+        Ok(false) => {}
+        Err(_) => {
+          push_runtime_log(
+            LogLevel::Error,
+            "Recovered from an unexpected panic inside the Windows mouse hook.",
+          );
+        }
+      }
+    }
+  }
+
+  CallNextHookEx(HHOOK(null_mut()), code, wparam, lparam)
+}
+
+unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+  if code == HC_ACTION as i32 {
+    if let Some(context) = current_hook_context() {
+      let keyboard = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
+      let hook_result = catch_unwind(AssertUnwindSafe(|| {
+        context.handle_emergency_stop_hotkey(wparam.0 as u32, keyboard)
+      }));
+      match hook_result {
+        Ok(true) => return LRESULT(1),
+        Ok(false) => {}
+        Err(_) => {
+          push_runtime_log(
+            LogLevel::Error,
+            "Recovered from an unexpected panic inside the Windows keyboard hook.",
+          );
+        }
       }
     }
   }
@@ -904,9 +1193,13 @@ fn should_process_mouse_message(
   inside_primary: bool,
   drag_from_primary: bool,
   sync_mouse_move: bool,
+  game_mode: bool,
 ) -> bool {
   match message {
     WM_MOUSEMOVE => {
+      if game_mode && !drag_from_primary {
+        return false;
+      }
       if drag_from_primary {
         sync_mouse_move
       } else {
@@ -1014,7 +1307,7 @@ fn dispatch_window_message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
 fn dispatch_window_message_sync(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> bool {
   let mut result = 0usize;
   unsafe {
-    let _ = SendMessageTimeoutW(
+    SendMessageTimeoutW(
       hwnd,
       message,
       wparam,
@@ -1022,9 +1315,9 @@ fn dispatch_window_message_sync(hwnd: HWND, message: u32, wparam: WPARAM, lparam
       SMTO_ABORTIFHUNG | SMTO_BLOCK,
       60,
       Some(&mut result),
-    );
+    )
+    .0 != 0
   }
-  true
 }
 
 fn pack_point(point: POINT) -> isize {
@@ -1156,14 +1449,46 @@ fn mouse_button_from_message(message: u32) -> Option<u32> {
 fn should_append_buffered_point(
   gesture: &BufferedPointerGesture,
   point: NormalizedPoint,
+  game_mode: bool,
 ) -> bool {
   let Some(last) = gesture.points.last() else {
     return true;
   };
 
+  let minimum_delta = if game_mode {
+    GAME_MODE_GESTURE_POINT_DELTA
+  } else {
+    DEFAULT_GESTURE_POINT_DELTA
+  };
   let dx = (last.rx - point.rx).abs();
   let dy = (last.ry - point.ry).abs();
-  dx > 0.001 || dy > 0.001
+  dx > minimum_delta || dy > minimum_delta
+}
+
+fn downsample_gesture_points(points: &[NormalizedPoint], max_points: usize) -> Vec<NormalizedPoint> {
+  if points.len() <= max_points || max_points < 2 {
+    return points.to_vec();
+  }
+
+  let last_index = points.len() - 1;
+  let interior_slots = max_points - 2;
+  let mut reduced = Vec::with_capacity(max_points);
+  reduced.push(points[0]);
+
+  for slot in 1..=interior_slots {
+    let index = (slot * last_index) / (interior_slots + 1);
+    let clamped_index = index.clamp(1, last_index.saturating_sub(1));
+    let point = points[clamped_index];
+    if reduced.last().copied() != Some(point) {
+      reduced.push(point);
+    }
+  }
+
+  if reduced.last().copied() != Some(points[last_index]) {
+    reduced.push(points[last_index]);
+  }
+
+  reduced
 }
 
 fn button_mask(button: MouseButton) -> u32 {
@@ -1204,7 +1529,6 @@ fn format_handle_handle(handle: usize) -> String {
 
 fn detect_dispatch_mode(hwnd: HWND) -> DispatchMode {
   use windows::Win32::UI::WindowsAndMessaging::GetClassNameW;
-  use windows::Win32::System::Threading::{OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_NAME_WIN32};
   use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
   
   // Lấy class name
@@ -1225,12 +1549,21 @@ fn detect_dispatch_mode(hwnd: HWND) -> DispatchMode {
       if let Ok(handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
         let mut path_buf = [0u16; 1024];
         let mut size = path_buf.len() as u32;
-        if QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, windows::core::PWSTR(path_buf.as_mut_ptr()), &mut size).is_ok() {
+        let process_name = if QueryFullProcessImageNameW(
+          handle,
+          PROCESS_NAME_WIN32,
+          windows::core::PWSTR(path_buf.as_mut_ptr()),
+          &mut size,
+        )
+        .is_ok()
+        {
           let path = String::from_utf16_lossy(&path_buf[..size as usize]);
           path.split('\\').last().unwrap_or("").to_lowercase()
         } else {
           String::new()
-        }
+        };
+        let _ = windows::Win32::Foundation::CloseHandle(handle);
+        process_name
       } else {
         String::new()
       }

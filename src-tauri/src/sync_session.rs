@@ -9,6 +9,8 @@ use crate::platform;
 use crate::state::{push_log, unix_time_ms, AppState};
 use crate::window_registry;
 
+const MAX_GAME_MODE_TARGET_WINDOWS: usize = 4;
+
 pub fn create_session(app: &AppHandle, state: &AppState, config: SessionConfig) -> Result<SessionInfo> {
   validate_config(&config)?;
 
@@ -192,6 +194,12 @@ fn validate_config(config: &SessionConfig) -> Result<()> {
   if managed.len() > 20 {
     return Err(anyhow!(
       "Mirror Windows currently supports at most 20 managed windows per session."
+    ));
+  }
+
+  if config.game_mode && config.target_window_ids.len() > MAX_GAME_MODE_TARGET_WINDOWS {
+    return Err(anyhow!(
+      "Game mode currently allows up to {MAX_GAME_MODE_TARGET_WINDOWS} target windows to reduce freeze risk."
     ));
   }
 

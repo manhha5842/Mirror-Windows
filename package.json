@@ -1,6 +1,7 @@
 {
   "name": "mirror-windows",
-  "version": "0.1.1",
+  "version": "0.2.0",
+  "author": "Haha Studio",
   "license": "MIT",
   "type": "module",
   "scripts": {
