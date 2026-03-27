@@ -555,11 +555,19 @@ impl SyncRuntimeContext {
         Err(error) => DispatchOutcome::Failed(DispatchMode::SendInput, error.to_string()),
       };
     }
+    let mut pointer_state = PointerState {
+      buttons_down: gesture.button_mask,
+      ..Default::default()
+    };
 
-    self.focus_window(target_hwnd);
-
-    let down_outcome =
-      self.dispatch_send_input_to_target(target_root, gesture.down_message, first_point, mouse_data);
+    let down_outcome = self.dispatch_mouse_to_target(
+      target_root,
+      gesture.down_message,
+      first_point,
+      gesture.button_mask,
+      mouse_data,
+      &mut pointer_state,
+    );
     if !matches!(down_outcome, DispatchOutcome::Success(_)) {
       return down_outcome;
     }
@@ -570,15 +578,28 @@ impl SyncRuntimeContext {
       .skip(1)
       .take(replay_points.len().saturating_sub(2))
     {
-      let move_outcome =
-        self.dispatch_send_input_to_target(target_root, WM_MOUSEMOVE, point, mouse_data);
+      let move_outcome = self.dispatch_mouse_to_target(
+        target_root,
+        WM_MOUSEMOVE,
+        point,
+        gesture.button_mask,
+        mouse_data,
+        &mut pointer_state,
+      );
       if !matches!(move_outcome, DispatchOutcome::Success(_)) {
         return move_outcome;
       }
     }
 
     let last_point = replay_points.last().copied().unwrap_or(first_point);
-    self.dispatch_send_input_to_target(target_root, gesture.up_message, last_point, mouse_data)
+    self.dispatch_mouse_to_target(
+      target_root,
+      gesture.up_message,
+      last_point,
+      0,
+      mouse_data,
+      &mut pointer_state,
+    )
   }
 
   fn apply_dispatch_outcome(
@@ -659,8 +680,20 @@ impl SyncRuntimeContext {
     // Quyết định dispatch mode
     let dispatch_mode = match self.config.dispatch_mode {
       DispatchMode::WindowMessage => DispatchMode::WindowMessage,
-      DispatchMode::SendInput => DispatchMode::SendInput,
-      DispatchMode::Auto => detect_dispatch_mode(target_root),
+      DispatchMode::SendInput => {
+        if self.config.game_mode {
+          DispatchMode::SendInput
+        } else {
+          DispatchMode::WindowMessage
+        }
+      }
+      DispatchMode::Auto => {
+        if self.config.game_mode {
+          detect_dispatch_mode(target_root)
+        } else {
+          DispatchMode::WindowMessage
+        }
+      }
     };
     self.log_dispatch_mode_once(target_root_handle, dispatch_mode);
 
@@ -875,44 +908,6 @@ impl SyncRuntimeContext {
       FOREGROUND_TARGET_SETTLE_MS
     };
     thread::sleep(Duration::from_millis(settle_ms));
-  }
-
-  fn dispatch_send_input_to_target(
-    &self,
-    target_root_handle: usize,
-    message: u32,
-    normalized_point: NormalizedPoint,
-    mouse_data: u32,
-  ) -> DispatchOutcome {
-    let target_root = handle_to_hwnd(target_root_handle);
-    if unsafe { !IsWindow(target_root).as_bool() } {
-      self.mark_target_unavailable(target_root_handle, "target window is no longer valid");
-      return DispatchOutcome::Skipped("target window is no longer valid".to_string());
-    }
-
-    let Ok(target_client_rect) = get_client_rect(target_root) else {
-      self.mark_target_unavailable(target_root_handle, "failed to read target client rect");
-      return DispatchOutcome::Skipped("failed to read target client rect".to_string());
-    };
-    let target_bounds = bounds_from_client_rect(target_client_rect);
-
-    match GameInputDispatcher::dispatch_mouse(
-      target_root,
-      normalized_point,
-      &target_bounds,
-      message,
-      mouse_data,
-      self.config.game_mode,
-    ) {
-      Ok(()) => {
-        self.log_click_trace(target_root_handle, mouse_message_name(message), DispatchMode::SendInput);
-        if is_click_message(message) {
-          thread::sleep(Duration::from_millis(INTER_TARGET_CLICK_SETTLE_MS));
-        }
-        DispatchOutcome::Success(DispatchMode::SendInput)
-      }
-      Err(error) => DispatchOutcome::Failed(DispatchMode::SendInput, error.to_string()),
-    }
   }
 
   fn target_roots_snapshot(&self) -> Vec<usize> {

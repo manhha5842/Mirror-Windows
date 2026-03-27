@@ -11,8 +11,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOUSEEVENTF_WHEEL, MOUSEINPUT, MOUSE_EVENT_FLAGS,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, SetForegroundWindow, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
-    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    GetCursorPos, GetSystemMetrics, SetCursorPos, SetForegroundWindow, SM_CXVIRTUALSCREEN,
+    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
 };
 
 use crate::coordinate_mapper::{project_to_client, NormalizedPoint};
@@ -36,6 +36,7 @@ impl GameInputDispatcher {
         up_message: u32,
         game_mode: bool,
     ) -> Result<()> {
+        let _cursor_guard = CursorRestoreGuard::capture();
         let Some(first_point) = points.first().copied() else {
             return Err(anyhow!("Buffered gesture had no points"));
         };
@@ -68,6 +69,7 @@ impl GameInputDispatcher {
         mouse_data: u32,
         game_mode: bool,
     ) -> Result<()> {
+        let _cursor_guard = CursorRestoreGuard::capture();
         focus_target(target_hwnd, game_mode);
 
         let (target_x, target_y) = project_to_client(normalized_point, target_bounds);
@@ -104,6 +106,24 @@ impl GameInputDispatcher {
         }
 
         Ok(())
+    }
+}
+
+struct CursorRestoreGuard {
+    original_cursor_pos: Option<POINT>,
+}
+
+impl CursorRestoreGuard {
+    fn capture() -> Self {
+        Self {
+            original_cursor_pos: current_cursor_pos(),
+        }
+    }
+}
+
+impl Drop for CursorRestoreGuard {
+    fn drop(&mut self) {
+        restore_cursor_pos(self.original_cursor_pos);
     }
 }
 
@@ -247,4 +267,23 @@ fn hiword(value: usize) -> u16 {
 
 fn is_button_down_message(message: u32) -> bool {
     matches!(message, 0x0201 | 0x0204 | 0x0207)
+}
+
+fn current_cursor_pos() -> Option<POINT> {
+    let mut point = POINT::default();
+    if unsafe { GetCursorPos(&mut point) }.is_ok() {
+        Some(point)
+    } else {
+        None
+    }
+}
+
+fn restore_cursor_pos(point: Option<POINT>) {
+    let Some(point) = point else {
+        return;
+    };
+
+    unsafe {
+        let _ = SetCursorPos(point.x, point.y);
+    }
 }
