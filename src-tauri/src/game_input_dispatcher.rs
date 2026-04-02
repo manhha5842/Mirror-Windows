@@ -11,8 +11,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOUSEEVENTF_WHEEL, MOUSEINPUT, MOUSE_EVENT_FLAGS,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetCursorPos, GetSystemMetrics, SetCursorPos, SetForegroundWindow, SM_CXVIRTUALSCREEN,
-    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    GetCursorPos, GetForegroundWindow, GetSystemMetrics, SetCursorPos, SetForegroundWindow,
+    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
 };
 
 use crate::coordinate_mapper::{project_to_client, NormalizedPoint};
@@ -41,7 +41,7 @@ impl GameInputDispatcher {
             return Err(anyhow!("Buffered gesture had no points"));
         };
 
-        focus_target(target_hwnd, game_mode);
+        focus_target(target_hwnd, game_mode)?;
         dispatch_move(target_hwnd, first_point, target_bounds)?;
         thread::sleep(Duration::from_millis(GAME_MODE_MOVE_SETTLE_MS));
         dispatch_button(target_hwnd, first_point, target_bounds, down_message)?;
@@ -70,7 +70,7 @@ impl GameInputDispatcher {
         game_mode: bool,
     ) -> Result<()> {
         let _cursor_guard = CursorRestoreGuard::capture();
-        focus_target(target_hwnd, game_mode);
+        focus_target(target_hwnd, game_mode)?;
 
         let (target_x, target_y) = project_to_client(normalized_point, target_bounds);
         let absolute_coords = client_to_absolute(target_hwnd, POINT { x: target_x, y: target_y })?;
@@ -127,16 +127,31 @@ impl Drop for CursorRestoreGuard {
     }
 }
 
-fn focus_target(target_hwnd: HWND, game_mode: bool) {
-    unsafe {
-        let _ = SetForegroundWindow(target_hwnd);
-    }
+fn focus_target(target_hwnd: HWND, game_mode: bool) -> Result<()> {
     let settle_ms = if game_mode {
         GAME_MODE_FOCUS_SETTLE_MS
     } else {
         DEFAULT_FOCUS_SETTLE_MS
     };
-    thread::sleep(Duration::from_millis(settle_ms));
+
+    for attempt in 0..2 {
+        unsafe {
+            let _ = SetForegroundWindow(target_hwnd);
+        }
+        thread::sleep(Duration::from_millis(settle_ms));
+
+        if unsafe { GetForegroundWindow() } == target_hwnd {
+            return Ok(());
+        }
+
+        if attempt == 0 {
+            thread::sleep(Duration::from_millis(24));
+        }
+    }
+
+    Err(anyhow!(
+        "Failed to focus target window before SendInput replay"
+    ))
 }
 
 fn click_hold_ms(game_mode: bool) -> u64 {

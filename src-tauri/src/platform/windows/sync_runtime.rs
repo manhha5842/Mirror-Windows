@@ -40,7 +40,7 @@ const INTER_TARGET_CLICK_SETTLE_MS: u64 = 4;
 const CLICK_SLOP_PX: i32 = 6;
 const FOREGROUND_TARGET_SETTLE_MS: u64 = 70;
 const GAME_MODE_FOREGROUND_TARGET_SETTLE_MS: u64 = 130;
-const PRIMARY_CLICK_SETTLE_MS: u64 = 45;
+const PRIMARY_REPLAY_SETTLE_MS: u64 = 45;
 const SUMMARY_LOG_COOLDOWN_MS: u128 = 3_000;
 const ISSUE_LOG_COOLDOWN_MS: u128 = 5_000;
 const TARGET_REMOVAL_LOG_COOLDOWN_MS: u128 = 15_000;
@@ -183,6 +183,16 @@ enum DispatchOutcome {
   Success(DispatchMode),
   Failed(DispatchMode, String),
   Skipped(String),
+}
+
+struct ReplayGuard<'a> {
+  flag: &'a AtomicBool,
+}
+
+impl Drop for ReplayGuard<'_> {
+  fn drop(&mut self) {
+    self.flag.store(false, Ordering::Release);
+  }
 }
 
 impl SyncRuntimeContext {
@@ -358,7 +368,7 @@ impl SyncRuntimeContext {
       if let Some(context) = current_hook_context() {
         let mouse_data = hook.mouseData;
         thread::spawn(move || {
-          thread::sleep(Duration::from_millis(PRIMARY_CLICK_SETTLE_MS));
+          thread::sleep(Duration::from_millis(PRIMARY_REPLAY_SETTLE_MS));
           context.replay_buffered_gesture(gesture, mouse_data);
           if context.config.layout_mode == LayoutMode::Stack && is_click_message(message) {
             let _ = bring_window_to_front(&context.config.primary_window_id);
@@ -436,6 +446,28 @@ impl SyncRuntimeContext {
       return;
     };
 
+    if self.config.game_mode {
+      if self
+        .replay_in_progress
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+      {
+        return;
+      }
+
+      if let Some(context) = current_hook_context() {
+        let mouse_data = hook.mouseData;
+        thread::spawn(move || {
+          thread::sleep(Duration::from_millis(PRIMARY_REPLAY_SETTLE_MS));
+          context.replay_wheel_to_targets(message, normalized_point, mouse_data);
+        });
+      } else {
+        thread::sleep(Duration::from_millis(PRIMARY_REPLAY_SETTLE_MS));
+        self.replay_wheel_to_targets(message, normalized_point, hook.mouseData);
+      }
+      return;
+    }
+
     let mut dummy_pointer_state = PointerState::default();
     let mut summary = DispatchSummary::default();
     for &target_root in target_roots {
@@ -454,17 +486,50 @@ impl SyncRuntimeContext {
     self.log_summary_if_needed(message, summary);
   }
 
-  fn replay_buffered_gesture(&self, gesture: BufferedPointerGesture, mouse_data: u32) {
-    struct ReplayGuard<'a> {
-      flag: &'a AtomicBool,
+  fn replay_wheel_to_targets(&self, message: u32, normalized_point: NormalizedPoint, mouse_data: u32) {
+    let _replay_guard = ReplayGuard {
+      flag: &self.replay_in_progress,
+    };
+    let target_roots = self.target_roots_snapshot();
+    if target_roots.is_empty() {
+      return;
     }
 
-    impl Drop for ReplayGuard<'_> {
-      fn drop(&mut self) {
-        self.flag.store(false, Ordering::Release);
+    let replay_started_at = Instant::now();
+    let cursor_before = current_cursor_pos();
+    let mut dummy_pointer_state = PointerState::default();
+    let mut summary = DispatchSummary::default();
+
+    for &target_root in &target_roots {
+      if self.circuit_breaker_open.load(Ordering::Acquire) {
+        break;
       }
+      summary.attempted += 1;
+      let outcome = self.dispatch_mouse_to_target(
+        target_root,
+        message,
+        normalized_point,
+        0,
+        mouse_data,
+        &mut dummy_pointer_state,
+      );
+      self.apply_dispatch_outcome(&mut summary, target_root, message, outcome);
     }
 
+    self.focus_window(handle_to_hwnd(self.primary_root));
+    restore_cursor_pos(cursor_before);
+
+    if self.config.game_mode && replay_started_at.elapsed().as_millis() > GAME_MODE_REPLAY_WATCHDOG_MS {
+      self.trip_circuit_breaker(format!(
+        "Game mode watchdog stopped mirroring because one wheel replay took more than {} ms.",
+        GAME_MODE_REPLAY_WATCHDOG_MS
+      ));
+    }
+
+    self.log_summary_if_needed(message, summary);
+  }
+
+  fn replay_buffered_gesture(&self, gesture: BufferedPointerGesture, mouse_data: u32) {
     let _replay_guard = ReplayGuard {
       flag: &self.replay_in_progress,
     };
